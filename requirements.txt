@@ -1,0 +1,5 @@
+aiohttp==3.12.13
+eth_account==0.13.7
+fake_useragent==2.2.0
+pyfiglet==1.0.3
+rich==14.0.0
