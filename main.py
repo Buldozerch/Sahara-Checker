@@ -1,6 +1,5 @@
 import asyncio
 import aiohttp
-import logo
 import json
 import csv
 from datetime import datetime, timezone
@@ -8,6 +7,7 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 import time
 import random
+import os
 import string
 import logging
 from fake_useragent import UserAgent
@@ -29,6 +29,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ethereum_client")
 
+# Установка политики event loop для Windows
+if os.name == 'nt':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 class EthereumClient:
     def __init__(self):
@@ -36,7 +39,7 @@ class EthereumClient:
         
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
-        connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+        connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)  # Уменьшены лимиты
         self.session = aiohttp.ClientSession(
             timeout=timeout,
             connector=connector
@@ -79,13 +82,8 @@ Expiration Time: {expiration_time}"""
     def sign_message(self, private_key, message):
         """Подписывает сообщение приватным ключом"""
         try:
-            # Создаем аккаунт из приватного ключа
             account = Account.from_key(private_key)
-            
-            # Кодируем сообщение для подписи
             message_hash = encode_defunct(text=message)
-            
-            # Подписываем
             signed_message = account.sign_message(message_hash)
             
             return {
@@ -94,17 +92,17 @@ Expiration Time: {expiration_time}"""
                 'message': message
             }
         except Exception as e:
-            print(f"Ошибка при подписи сообщения: {e}")
+            logger.error(f"Ошибка при подписи сообщения: {e}")
             return None
     
-    async def sign_in(self, address, signature, message, user_agent, proxy=None):
-        """Выполняет первый запрос - sign_in"""
+    async def sign_in(self, address, signature, message, user_agent, proxy=None, retries=3):
+        """Выполняет sign_in запрос с повторными попытками"""
         headers = {
             'accept': '*/*',
             'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
             'content-type': 'application/json',
             'origin': 'https://knowledgedrop.saharaai.com',
-            'user-agent': f'{user_agent}'
+            'user-agent': user_agent
         }
         
         data = {
@@ -114,101 +112,107 @@ Expiration Time: {expiration_time}"""
             "public_key": ""
         }
         
-        try:
-            async with self.session.post(
-                'https://earndrop.prd.galaxy.eco/sign_in',
-                headers=headers,
-                json=data,
-                proxy=proxy,
-                timeout=30
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return result.get('token')
-                else:
-                    print(f"Ошибка sign_in: {response.status}")
-                    return None
-        except Exception as e:
-            print(f"Ошибка при sign_in запросе: {e}")
-            return None
+        for attempt in range(retries):
+            try:
+                async with self.session.post(
+                    'https://earndrop.prd.galaxy.eco/sign_in',
+                    headers=headers,
+                    json=data,
+                    proxy=proxy,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get('token')
+                    else:
+                        logger.error(f"Ошибка sign_in: HTTP {response.status}")
+                        if attempt < retries - 1:
+                            await asyncio.sleep(2 ** attempt)  # Экспоненциальная задержка
+            except Exception as e:
+                logger.error(f"Ошибка при sign_in запросе (попытка {attempt + 1}): {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+        
+        return None
     
-    async def get_info(self, token,user_agent, proxy=None):
-        """Выполняет второй запрос - получение информации"""
+    async def get_info(self, token, user_agent, proxy=None, retries=3):
+        """Выполняет запрос на получение информации с повторными попытками"""
         headers = {
             'accept': '*/*',
             'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
             'authorization': token,
             'origin': 'https://knowledgedrop.saharaai.com',
-            'user-agent': f'{user_agent}'
+            'user-agent': user_agent
         }
         
-        try:
-            async with self.session.get(
-                'https://earndrop.prd.galaxy.eco/sahara/info',
-                headers=headers,
-                proxy=proxy,
-                timeout=30
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    print(f"Ошибка get_info: {response.status}")
-                    return None
-        except Exception as e:
-            print(f"Ошибка при get_info запросе: {e}")
-            return None
+        for attempt in range(retries):
+            try:
+                async with self.session.get(
+                    'https://earndrop.prd.galaxy.eco/sahara/info',
+                    headers=headers,
+                    proxy=proxy,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        logger.error(f"Ошибка get_info: HTTP {response.status}")
+                        if attempt < retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+            except Exception as e:
+                logger.error(f"Ошибка при get_info запросе (попытка {attempt + 1}): {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+        
+        return None
     
-    async def process_wallet(self, private_key, proxy=None):
+    async def process_wallet(self, private_key, semaphore, proxy=None):
         """Обрабатывает один кошелек"""
-        try:
-            # Создаем аккаунт
-            account = Account.from_key(private_key)
-            address = account.address
-            
-            print(f"Обработка кошелька: {address}")
-            
-            # Создаем и подписываем сообщение
-            message = self.create_message(address)
-            signed_data = self.sign_message(private_key, message)
-            
-            if not signed_data:
-                return {"address": address, "status": "error", "error": "Ошибка подписи"}
-            
-            # Выполняем sign_in
-            user_agent =  UserAgent(platforms='desktop')
-            user_agent = user_agent.random
-            token = await self.sign_in(
-                signed_data['address'], 
-                signed_data['signature'], 
-                signed_data['message'],
-                user_agent,
-                proxy
-            )
-            
-            if not token:
-                return {"address": address, "status": "error", "error": "Ошибка sign_in"}
-            
-            # Получаем информацию
-            info = await self.get_info(token,user_agent, proxy)
-            
-            if not info:
-                return {"address": address, "status": "error", "error": "Ошибка get_info"}
-            
-            # Парсим результат
-            data = info.get('data', {})
-            total_amount = float(data.get('total_amount', '0')) / 10**18  # Wei to ETH
-            
-            return {
-                "address": address,
-                "status": "success",
-                "total_amount": total_amount,
-                "claimed_amount": float(data.get('claimed_amount', '0')) / 10**18,
-                "eligible_amount": float(data.get('eligible_amount', '0')) / 10**18,
-                "stages_count": len(data.get('stages', []))
-            }
-            
-        except Exception as e:
-            return {"address": "unknown", "status": "error", "error": str(e)}
+        async with semaphore:  # Ограничиваем одновременные запросы
+            try:
+                account = Account.from_key(private_key)
+                address = account.address
+                
+                logger.info(f"Обработка кошелька: {address}")
+                
+                message = self.create_message(address)
+                signed_data = self.sign_message(private_key, message)
+                
+                if not signed_data:
+                    return {"address": address, "status": "error", "error": "Ошибка подписи"}
+                
+                user_agent = UserAgent(platforms='desktop').random
+                token = await self.sign_in(
+                    signed_data['address'], 
+                    signed_data['signature'], 
+                    signed_data['message'],
+                    user_agent,
+                    proxy
+                )
+                
+                if not token:
+                    return {"address": address, "status": "error", "error": "Ошибка sign_in"}
+                
+                info = await self.get_info(token, user_agent, proxy)
+                
+                if not info:
+                    return {"address": address, "status": "error", "error": "Ошибка get_info"}
+                
+                data = info.get('data', {})
+                total_amount = float(data.get('total_amount', '0')) / 10**18
+                
+                return {
+                    "address": address,
+                    "status": "success",
+                    "total_amount": total_amount,
+                    "claimed_amount": float(data.get('claimed_amount', '0')) / 10**18,
+                    "eligible_amount": float(data.get('eligible_amount', '0')) / 10**18,
+                    "stages_count": len(data.get('stages', []))
+                }
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки кошелька {address}: {e}")
+                return {"address": address, "status": "error", "error": str(e)}
 
 def save_results_to_csv(results, filename="results.csv"):
     """Сохраняет результаты в CSV файл"""
@@ -242,16 +246,14 @@ def save_results_to_csv(results, filename="results.csv"):
                         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     })
         
-        print(f"📄 Результаты сохранены в файл: {filename}")
+        logger.info(f"📄 Результаты сохранены в файл: {filename}")
         return True
     except Exception as e:
-        print(f"❌ Ошибка при сохранении в CSV: {e}")
+        logger.error(f"❌ Ошибка при сохранении в CSV: {e}")
         return False
 
 def print_results_table(results):
-    """Выводит красивую таблицу результатов используя Rich"""
-    
-    # Создаем таблицу результатов
+    """Выводит таблицу результатов используя Rich"""
     table = Table(box=box.ROUNDED, title="📊 Результаты обработки кошельков")
     table.add_column("№", style="dim", width=3)
     table.add_column("Адрес", style="cyan", width=42)
@@ -265,7 +267,6 @@ def print_results_table(results):
     successful = 0
     total_amount = 0
     
-    # Заполняем таблицу данными
     for i, result in enumerate(results, 1):
         if isinstance(result, dict):
             address = result['address']
@@ -302,17 +303,14 @@ def print_results_table(results):
             table.add_row(
                 str(i),
                 "unknown",
-                "[bright_red]💥 Критическая[/bright_red]",
                 "-",
-                "-", 
+                "-",
                 "-",
                 f"[bright_red]{error_str}[/bright_red]"
             )
     
-    # Выводим таблицу
     console.print(table)
     
-    # Общая статистика в панели
     success_rate = (successful/total_wallets*100) if total_wallets > 0 else 0
     
     stats_text = f"""📊 Всего кошельков:           {total_wallets}
@@ -328,13 +326,13 @@ def load_private_keys(filename="private.txt"):
     try:
         with open(filename, 'r', encoding='utf-8') as f:
             keys = [line.strip() for line in f if line.strip()]
-        print(f"📁 Загружено {len(keys)} приватных ключей из {filename}")
+        logger.info(f"📁 Загружено {len(keys)} приватных ключей из {filename}")
         return keys
     except FileNotFoundError:
-        print(f"❌ Файл {filename} не найден")
+        logger.error(f"❌ Файл {filename} не найден")
         return []
     except Exception as e:
-        print(f"❌ Ошибка при чтении файла {filename}: {e}")
+        logger.error(f"❌ Ошибка при чтении файла {filename}: {e}")
         return []
 
 def load_proxies(filename="proxy.txt"):
@@ -343,50 +341,55 @@ def load_proxies(filename="proxy.txt"):
         with open(filename, 'r', encoding='utf-8') as f:
             proxies = [line.strip() for line in f if line.strip()]
         if proxies:
-            print(f"🌐 Загружено {len(proxies)} прокси из {filename}")
+            logger.info(f"🌐 Загружено {len(proxies)} прокси из {filename}")
         return proxies
     except FileNotFoundError:
-        print(f"📁 Файл {filename} не найден, прокси не используются")
+        logger.info(f"📁 Файл {filename} не найден, прокси не используются")
         return []
     except Exception as e:
-        print(f"❌ Ошибка при чтении файла {filename}: {e}")
+        logger.error(f"❌ Ошибка при чтении файла {filename}: {e}")
         return []
 
 async def main():
     """Главная функция"""
-    # Загружаем данные из файлов
     private_keys = load_private_keys("private.txt")
     proxies = load_proxies("proxy.txt")
     
     if not private_keys:
-        print("Не найдены приватные ключи в файле private.txt")
-        print("Создайте файл private.txt и добавьте приватные ключи, каждый с новой строки")
+        logger.error("Не найдены приватные ключи в файле private.txt")
+        logger.info("Создайте файл private.txt и добавьте приватные ключи, каждый с новой строки")
         return
     
-    print(f"Загружено {len(private_keys)} приватных ключей")
+    logger.info(f"Загружено {len(private_keys)} приватных ключей")
     if proxies:
-        print(f"Загружено {len(proxies)} прокси")
+        logger.info(f"Загружено {len(proxies)} прокси")
     else:
-        print("Прокси не используются")
+        logger.info("Прокси не используются")
     
     results = []
+    semaphore = asyncio.Semaphore(10)  # Ограничиваем до 5 одновременных запросов
     
     async with EthereumClient() as client:
         tasks = []
         
         for i, private_key in enumerate(private_keys):
             proxy = proxies[i % len(proxies)] if proxies else None
-            task = client.process_wallet(private_key, proxy)
+            task = client.process_wallet(private_key=private_key, proxy=proxy, semaphore=semaphore)
             tasks.append(task)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console
+        ) as progress:
+            task = progress.add_task("Обработка кошельков...", total=len(tasks))
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            progress.update(task, advance=len(tasks))
         
-        # Выполняем все задачи параллельно
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+        # results = await asyncio.gather(*tasks, return_exceptions=True)
     
     print_results_table(results)
     save_results_to_csv(results)
 
 if __name__ == "__main__":
-    # Установите необходимые библиотеки:
-    
     asyncio.run(main())
